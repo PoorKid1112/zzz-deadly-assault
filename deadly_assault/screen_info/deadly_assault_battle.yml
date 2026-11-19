@@ -1,0 +1,30 @@
+screen_id: deadly_assault_battle
+screen_name: 危局强袭战-关卡详情
+app_id: deadly_assault
+pc_alt: false
+area_list:
+  - area_name: 下一步
+    pc_rect: [1640, 990, 1790, 1060]
+    text: 下一步
+    lcs_percent: 0.7
+  - area_name: 开始挑战
+    pc_rect: [1640, 990, 1790, 1060]
+    text: 开始挑战
+    lcs_percent: 0.7
+  - area_name: 锁定确认-标题
+    pc_rect: [820, 450, 1080, 520]
+    text: 是否确认出战
+    lcs_percent: 0.6
+  - area_name: 锁定确认-取消
+    pc_rect: [750, 620, 900, 700]
+    text: 取消
+    lcs_percent: 0.7
+  - area_name: 锁定确认-确认
+    pc_rect: [1050, 620, 1200, 700]
+    text: 确认
+    lcs_percent: 0.7
+  - area_name: 返回
+    pc_rect: [82, 13, 150, 90]
+    template_sub_dir: menu
+    template_id: back
+    template_match_threshold: 0.7
