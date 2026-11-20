@@ -31,11 +31,13 @@ class DeadlyAssaultApp(ZApplication):
 
     完整支持：
     1. 从大世界/菜单进入快捷手册-作战-危局强袭战（试炼模式）
-    2. 智能推荐配队：打开配队指引、智能推荐、生成更多并等待约5分钟、应用全部阵容（若有多个优先最下方）、确认阵容覆盖
-    3. 依次挑战3个首领：点击EMPTY关卡槽（越往左优先度越高，依次左、中、右）
-    4. 进战逻辑：点击下一步、出战确认、进战后按住W前进5秒并启动自动战斗
+    2. 智能推荐配队：打开配队指引、智能推荐、生成更多并等待、应用全部阵容（若有多个优先最下方）、确认阵容覆盖
+    3. 依次挑战3个首领：检测下方关卡槽位的 EMPTY 标识并精确点击（越往左优先度越高，依次左、中、右）
+    4. 进战逻辑：点击选定敌方、点击下一步/开始挑战、出战确认、进战后按住W前进同时检测Boss血条并启动自动战斗
     5. 战斗结算：出现退出按钮时结束战斗并退出
-    6. 荣誉酬赏：3关全部完成后，点击荣誉酬赏上方图标、全部领取、确认、返回
+    6. 荣誉酬赏：3关全部完成后，检测左下角荣誉酬赏并点击其上方图标、全部领取、确认、返回
+
+    所有点击动作严格遵循规范：在目标区域检测到符合要求的特征/文本后再行点击，绝无盲点固定坐标操作。
     """
 
     STATUS_NEED_TEAM_GUIDE: ClassVar[str] = '需要配队'
@@ -85,7 +87,7 @@ class DeadlyAssaultApp(ZApplication):
         log.info('插件运行截图已保存至: %s', file_path)
         return file_path
 
-    def is_in_deadly_assault_main(self, screen: MatLike) -> bool:
+    def is_in_deadly_assault_main(self, screen: MatLike | None) -> bool:
         """判断是否处于危局强袭战主界面。"""
         if screen is None:
             return False
@@ -175,8 +177,7 @@ class DeadlyAssaultApp(ZApplication):
     @operation_node(name='等待主界面加载')
     def wait_main_screen(self) -> OperationRoundResult:
         """等待危局强袭战主界面加载完毕 (Step 6)。"""
-        res = self.round_by_find_area(self.last_screenshot, '危局强袭战-主界面', '选定敌方')
-        if res.is_success:
+        if self.is_in_deadly_assault_main(self.last_screenshot):
             if self.config.auto_team:
                 return self.round_success(self.STATUS_NEED_TEAM_GUIDE)
             return self.round_success(self.STATUS_SKIP_TEAM_GUIDE)
@@ -203,37 +204,63 @@ class DeadlyAssaultApp(ZApplication):
     @operation_node(name='检查规则说明弹窗')
     def check_rule_dialog(self) -> OperationRoundResult:
         """检查并关闭可能出现的规则说明弹窗 (Step 7)。"""
-        find_res = self.round_by_find_area(self.last_screenshot, '危局强袭战-配队指引', '规则说明')
         words = self.ctx.ocr.match_words(self.last_screenshot, ['规则说明'], threshold=0.6)
-        if find_res.is_success or '规则说明' in words:
-            log.info('检测到规则说明弹窗，点击右上角叉号关闭')
+        if '规则说明' in words:
+            log.info('检测到规则说明弹窗，查找右上角关闭按钮')
+            # 1. 优先尝试模板匹配
             click_res = self.round_by_find_and_click_area(
                 self.last_screenshot,
                 '危局强袭战-配队指引',
                 '规则说明-关闭',
                 success_wait=1.8,
             )
-            if not click_res.is_success:
-                self.round_by_click_area('危局强袭战-配队指引', '规则说明-关闭', success_wait=1.8)
+            if click_res.is_success:
+                return self.round_success()
+
+            # 2. 特征匹配：检测右上角关闭按钮区域内的红色关闭叉号按键
+            close_area = self.ctx.screen_loader.get_area('危局强袭战-配队指引', '规则说明-关闭')
+            if close_area is not None and self.last_screenshot is not None:
+                screen = self.last_screenshot
+                h, w = screen.shape[:2]
+                screen_1080 = cv2.resize(screen, (1920, 1080)) if (w, h) != (1920, 1080) else screen
+                crop = screen_1080[close_area.rect.y1:close_area.rect.y2, close_area.rect.x1:close_area.rect.x2]
+                r, g, b = crop[:, :, 0], crop[:, :, 1], crop[:, :, 2]
+                red_pts = np.argwhere((r > 150) & (g < 70) & (b < 70))
+                if len(red_pts) >= 30:
+                    min_y, min_x = red_pts.min(axis=0)
+                    max_y, max_x = red_pts.max(axis=0)
+                    target = Point(close_area.rect.x1 + (min_x + max_x) // 2, close_area.rect.y1 + (min_y + max_y) // 2)
+                    log.info('特征检测到规则说明关闭叉号位置: (%d, %d)', target.x, target.y)
+                    self.ctx.controller.click(target)
+                    time.sleep(1.8)
+                    return self.round_success()
+
+            return self.round_retry('检测到规则说明弹窗但未定位到关闭按钮', wait=1.5)
         else:
             log.info('未出现规则说明弹窗，直接进入下一步')
-        return self.round_success()
+            return self.round_success()
 
     @node_from(from_name='检查规则说明弹窗')
     @operation_node(name='点击智能推荐', node_max_retry_times=5)
     def click_ai_recommend(self) -> OperationRoundResult:
         """点击智能推荐选项卡 (Step 8)。"""
-        # 容错与兜底：若规则说明弹窗仍未关闭，先点击关闭
+        # 容错与兜底：若规则说明弹窗仍未关闭，先关闭
         words = self.ctx.ocr.match_words(self.last_screenshot, ['规则说明'], threshold=0.6)
         if '规则说明' in words:
             log.info('点击智能推荐前检测到规则说明弹窗仍存在，先点击关闭')
-            self.round_by_find_and_click_area(
-                self.last_screenshot,
-                '危局强袭战-配队指引',
-                '规则说明-关闭',
-                success_wait=1.8,
-            )
-            time.sleep(1.0)
+            close_area = self.ctx.screen_loader.get_area('危局强袭战-配队指引', '规则说明-关闭')
+            if close_area is not None and self.last_screenshot is not None:
+                screen = self.last_screenshot
+                h, w = screen.shape[:2]
+                screen_1080 = cv2.resize(screen, (1920, 1080)) if (w, h) != (1920, 1080) else screen
+                crop = screen_1080[close_area.rect.y1:close_area.rect.y2, close_area.rect.x1:close_area.rect.x2]
+                r, g, b = crop[:, :, 0], crop[:, :, 1], crop[:, :, 2]
+                red_pts = np.argwhere((r > 150) & (g < 70) & (b < 70))
+                if len(red_pts) >= 30:
+                    min_y, min_x = red_pts.min(axis=0)
+                    max_y, max_x = red_pts.max(axis=0)
+                    self.ctx.controller.click(Point(close_area.rect.x1 + (min_x + max_x) // 2, close_area.rect.y1 + (min_y + max_y) // 2))
+                    time.sleep(1.5)
 
         area = self.ctx.screen_loader.get_area('危局强袭战-配队指引', '智能推荐')
         return self.round_by_ocr_and_click(
@@ -241,8 +268,8 @@ class DeadlyAssaultApp(ZApplication):
             target_cn='智能推荐',
             area=area,
             crop_first=False,
-            success_wait=1.5,
-            retry_wait=1.2,
+            success_wait=1.8,
+            retry_wait=1.5,
         )
 
     @node_from(from_name='点击智能推荐')
@@ -266,6 +293,8 @@ class DeadlyAssaultApp(ZApplication):
             success_wait=1.8,
             retry_wait=1.5,
         )
+        if not res.is_success:
+            return res
 
         self.generate_start_time = time.time()
         log.info('已触发生成更多，进入生成等待（最大 %d 秒）', self.config.wait_generate_seconds)
@@ -327,7 +356,7 @@ class DeadlyAssaultApp(ZApplication):
     @node_from(from_name='等待生成配队')
     @operation_node(name='应用全部阵容', node_max_retry_times=5)
     def apply_all_teams(self) -> OperationRoundResult:
-        """点击全部应用，若有多个则优先最下方 (Step 10)。"""
+        """在全部应用区域检测并点击按钮，若有多个则优先最下方 (Step 10)。"""
         apply_area = self.ctx.screen_loader.get_area('危局强袭战-配队指引', '全部应用-区域')
         crop = self.last_screenshot[apply_area.rect.y1:apply_area.rect.y2, apply_area.rect.x1:apply_area.rect.x2]
         ocr_res = self.ctx.ocr.ocr(crop)
@@ -337,59 +366,60 @@ class DeadlyAssaultApp(ZApplication):
             apply_buttons.sort(key=lambda item: item.rect.center.y, reverse=True)
             chosen = apply_buttons[0]
             target_pt = Point(apply_area.rect.x1 + chosen.rect.center.x, apply_area.rect.y1 + chosen.rect.center.y)
-            log.info('找到 %d 个全部应用按钮，点击最下方按钮 (%d, %d)',
+            log.info('在全部应用区域检测到 %d 个按钮，点击最下方按钮 (%d, %d)',
                      len(apply_buttons), target_pt.x, target_pt.y)
             self.ctx.controller.click(target_pt)
-            time.sleep(1.8)
+            time.sleep(2.0)
             return self.round_success()
 
-        log.info('未在区域内解析到全部应用文字，点击区域推荐位置')
-        self.ctx.controller.click(Point(apply_area.center.x, apply_area.rect.y2 - 30))
-        time.sleep(1.8)
-        return self.round_success()
+        # 严格遵守规范：绝不盲目点击固定坐标！若未检测到按钮文字，进行重试
+        log.warning('未在配队指引的指定区域内检测到全部应用按钮，等待重试')
+        return self.round_retry('未检测到全部应用按钮', wait=1.5)
 
     @node_from(from_name='应用全部阵容')
     @operation_node(name='确认阵容覆盖')
     def confirm_cover_team(self) -> OperationRoundResult:
-        """如果存在阵容覆盖确认对话框，点击确认 (Step 11)。"""
-        find_res = self.round_by_find_area(self.last_screenshot, '危局强袭战-配队指引', '阵容覆盖')
+        """如果存在阵容覆盖确认对话框，检测并点击确认 (Step 11)。"""
         words = self.ctx.ocr.match_words(self.last_screenshot, ['阵容覆盖', '是否确认'], threshold=0.6)
-        if find_res.is_success or '阵容覆盖' in words or '是否确认' in words:
-            log.info('检测到阵容覆盖确认弹窗，点击确认')
-            click_res = self.round_by_find_and_click_area(
+        if '阵容覆盖' in words or '是否确认' in words:
+            log.info('检测到阵容覆盖确认弹窗，检测并点击确认按钮')
+            area = self.ctx.screen_loader.get_area('危局强袭战-配队指引', '阵容覆盖-确认')
+            return self.round_by_ocr_and_click(
                 self.last_screenshot,
-                '危局强袭战-配队指引',
-                '阵容覆盖-确认',
+                target_cn='确认',
+                area=area,
                 crop_first=False,
                 success_wait=2.0,
                 retry_wait=1.5,
             )
-            if not click_res.is_success:
-                self.round_by_click_area('危局强袭战-配队指引', '阵容覆盖-确认', success_wait=2.0)
         else:
             log.info('未出现阵容覆盖确认弹窗，直接进入下一步')
-        return self.round_success()
+            return self.round_success()
 
     @node_from(from_name='确认阵容覆盖')
     @operation_node(name='返回危局主界面', node_max_retry_times=5)
     def back_from_team_guide(self) -> OperationRoundResult:
-        """点击左上角返回按钮回到危局强袭战主界面 (Step 12)。
-
-        遵循规范：优先复用框架通用“画面-通用”的“返回”区域（模板匹配 menu/back，标准坐标 [82, 13, 150, 90]，中心 116, 51）。
-        """
+        """点击左上角返回按钮回到危局强袭战主界面 (Step 12)。"""
         # 容错与兜底：若阵容覆盖弹窗仍未确认，先点击确认
         words = self.ctx.ocr.match_words(self.last_screenshot, ['阵容覆盖', '是否确认'], threshold=0.6)
         if '阵容覆盖' in words or '是否确认' in words:
             log.info('返回主界面前检测到阵容覆盖确认弹窗仍存在，先点击确认')
-            self.round_by_find_and_click_area(
+            area = self.ctx.screen_loader.get_area('危局强袭战-配队指引', '阵容覆盖-确认')
+            return self.round_by_ocr_and_click(
                 self.last_screenshot,
-                '危局强袭战-配队指引',
-                '阵容覆盖-确认',
+                target_cn='确认',
+                area=area,
                 crop_first=False,
                 success_wait=2.0,
+                retry_wait=1.5,
             )
-            time.sleep(1.0)
 
+        # 检查是否已在危局主界面
+        if self.is_in_deadly_assault_main(self.last_screenshot):
+            log.info('已回到危局强袭战主界面')
+            return self.round_success()
+
+        # 1. 尝试框架通用返回区域匹配
         res = self.round_by_find_and_click_area(
             self.last_screenshot,
             '画面-通用',
@@ -400,8 +430,25 @@ class DeadlyAssaultApp(ZApplication):
         if res.is_success:
             return self.round_success()
 
-        # 兜底使用配队指引中配置的返回区域
-        return self.round_by_click_area('危局强袭战-配队指引', '返回', success_wait=2.0, retry_wait=1.5)
+        # 2. 特征检测：配队指引左上角红色药丸状返回按键检测（位置 [60, 15, 160, 85]）
+        screen = self.last_screenshot
+        if screen is not None:
+            h, w = screen.shape[:2]
+            screen_1080 = cv2.resize(screen, (1920, 1080)) if (w, h) != (1920, 1080) else screen
+            crop = screen_1080[15:85, 60:160]
+            # RGB 模式下 R > 150, G < 70, B < 70
+            r, g, b = crop[:, :, 0], crop[:, :, 1], crop[:, :, 2]
+            red_pts = np.argwhere((r > 150) & (g < 70) & (b < 70))
+            if len(red_pts) >= 50:
+                min_y, min_x = red_pts.min(axis=0)
+                max_y, max_x = red_pts.max(axis=0)
+                back_pt = Point(60 + (min_x + max_x) // 2, 15 + (min_y + max_y) // 2)
+                log.info('特征检测到左上角红色返回按键，点击 (%d, %d)', back_pt.x, back_pt.y)
+                self.ctx.controller.click(back_pt)
+                time.sleep(2.0)
+                return self.round_success()
+
+        return self.round_retry('未检测到左上角返回按钮', wait=1.5)
 
     # ---------------- 阶段 3: 循环挑战 3 个首领 (Step 13 - Step 25) ----------------
 
@@ -416,19 +463,30 @@ class DeadlyAssaultApp(ZApplication):
         - 第 1 轮 (Step 13): 下方灰色的 3 个 empty，越往左优先度越高 -> 点击左侧槽位
         - 第 2 轮 (Step 17): 点击中间的 empty -> 点击中间槽位
         - 第 3 轮 (Step 21): 点击左右侧剩余 empty -> 点击右侧槽位
-        - 全部挑战完毕后进入荣誉酬赏领取阶段
+        - 检测并验证目标槽位确实包含 EMPTY 标识后，点击其精确中心坐标；全部完成则进入荣誉酬赏。
         """
         if self.boss_cycle >= 3:
             log.info('3 轮关卡已全部挑战完毕，进入领奖流程')
             return self.round_success(self.STATUS_ALL_BOSSES_DONE)
 
         empty_states: list[bool] = []
+        slot_empty_centers: list[Point | None] = []
+
         for name in self.SLOT_NAMES:
             area = self.ctx.screen_loader.get_area('危局强袭战-主界面', name)
             crop = self.last_screenshot[area.rect.y1:area.rect.y2, area.rect.x1:area.rect.x2]
             ocr_res = self.ctx.ocr.ocr(crop)
-            is_empty = any('EMPTY' in r.data.upper() or '0' in r.data for r in ocr_res)
-            empty_states.append(is_empty)
+            empty_items = [r for r in ocr_res if 'EMPTY' in r.data.upper() or '0' in r.data]
+            if empty_items:
+                empty_states.append(True)
+                center_pt = Point(
+                    area.rect.x1 + empty_items[0].rect.center.x,
+                    area.rect.y1 + empty_items[0].rect.center.y,
+                )
+                slot_empty_centers.append(center_pt)
+            else:
+                empty_states.append(False)
+                slot_empty_centers.append(None)
 
         log.info('当前 3 个槽位状态: 左=%s, 中=%s, 右=%s (当前第 %d 轮)',
                  'EMPTY' if empty_states[0] else 'DONE',
@@ -445,11 +503,18 @@ class DeadlyAssaultApp(ZApplication):
 
         self.current_target_slot = target_slot
         chosen_slot_name = self.SLOT_NAMES[target_slot]
-        log.info('点击关卡槽位: %s', chosen_slot_name)
-        self.round_by_click_area('危局强袭战-主界面', chosen_slot_name, success_wait=2.0)
+        chosen_center = slot_empty_centers[target_slot]
 
-        self.boss_cycle += 1
-        return self.round_success(self.STATUS_BATTLE_TARGET)
+        if chosen_center is not None:
+            log.info('在 %s 区域检测到 EMPTY 标识，点击其中心坐标 (%d, %d)',
+                     chosen_slot_name, chosen_center.x, chosen_center.y)
+            self.ctx.controller.click(chosen_center)
+            time.sleep(2.0)
+            self.boss_cycle += 1
+            return self.round_success(self.STATUS_BATTLE_TARGET)
+        else:
+            log.warning('%s 区域内未检测到 EMPTY 标识，等待重试', chosen_slot_name)
+            return self.round_retry(f'未在{chosen_slot_name}检测到EMPTY标识', wait=1.5)
 
     @node_from(from_name='选择首领关卡', status=STATUS_BATTLE_TARGET)
     @operation_node(name='点击选定敌方', node_max_retry_times=5)
@@ -470,7 +535,7 @@ class DeadlyAssaultApp(ZApplication):
     def click_next(self) -> OperationRoundResult:
         """在关卡详情页面点击下一步或开始挑战 (Step 14, 18, 22)。
 
-        不同账号或关卡完成状态下，右下角按钮文本可能为'下一步'或'开始挑战'，OR 分支满足其一即点击。
+        不同账号或关卡完成状态下，右下角按钮文本可能为'下一步'或'开始挑战'，OR 分支检测满足其一即点击。
         """
         area = self.ctx.screen_loader.get_area('危局强袭战-关卡详情', '下一步')
         res = self.round_by_ocr_and_click_by_priority(
@@ -485,7 +550,7 @@ class DeadlyAssaultApp(ZApplication):
             log.info('成功点击右下角进战按钮: %s', res.status)
             return self.round_success()
 
-        # 备选：全屏匹配
+        # 备选：全屏匹配目标文字
         words = self.ctx.ocr.match_words(self.last_screenshot, ['下一步', '开始挑战', '挑战'], threshold=0.6)
         for k in ['下一步', '开始挑战', '挑战']:
             if k in words:
@@ -498,11 +563,9 @@ class DeadlyAssaultApp(ZApplication):
                     retry_wait=1.5,
                 )
 
-        # 兜底直接点击右下角按钮坐标 (1716, 1028)
-        log.info('未识别到下一步或开始挑战文字，点击右下角按钮兜底坐标 (1716, 1028)')
-        self.ctx.controller.click(Point(1716, 1028))
-        time.sleep(2.0)
-        return self.round_success()
+        # 严格遵守规范：绝不盲目点击固定坐标！若未识别到文字，进行重试
+        log.warning('未在关卡详情界面检测到下一步或开始挑战按钮，等待重试')
+        return self.round_retry('未识别到下一步或开始挑战文字', wait=1.5)
 
     @node_from(from_name='点击下一步')
     @operation_node(name='检查锁定出战弹窗')
@@ -511,24 +574,21 @@ class DeadlyAssaultApp(ZApplication):
 
         本弹窗为条件出现（并非一定出现）：若弹出，点击右侧'确认'继续；若未弹出，直接进入后续阶段。
         """
-        find_res = self.round_by_find_area(self.last_screenshot, '危局强袭战-关卡详情', '锁定确认-标题')
         words = self.ctx.ocr.match_words(self.last_screenshot, ['是否确认出战', '确认出战', '将被锁定'], threshold=0.6)
-        if find_res.is_success or any(k in words for k in ['是否确认出战', '确认出战', '将被锁定']):
-            log.info('检测到锁定出战提示弹窗（是否确认出战？），点击确认')
-            click_res = self.round_by_find_and_click_area(
+        if any(k in words for k in ['是否确认出战', '确认出战', '将被锁定']):
+            log.info('检测到锁定出战提示弹窗（是否确认出战？），检测并点击确认按钮')
+            area = self.ctx.screen_loader.get_area('危局强袭战-关卡详情', '锁定确认-确认')
+            return self.round_by_ocr_and_click(
                 self.last_screenshot,
-                '危局强袭战-关卡详情',
-                '锁定确认-确认',
+                target_cn='确认',
+                area=area,
                 crop_first=False,
                 success_wait=2.0,
                 retry_wait=1.5,
             )
-            if not click_res.is_success:
-                self.round_by_click_area('危局强袭战-关卡详情', '锁定确认-确认', success_wait=2.0)
         else:
             log.info('未出现锁定出战确认弹窗，直接进入出战阶段')
-
-        return self.round_success()
+            return self.round_success()
 
     @node_from(from_name='检查锁定出战弹窗')
     @operation_node(name='出战确认', node_max_retry_times=5)
@@ -537,15 +597,16 @@ class DeadlyAssaultApp(ZApplication):
         # 容错兜底：若前一步因网络或动画延迟，弹窗在此刻才渲染出来，先点击确认
         words = self.ctx.ocr.match_words(self.last_screenshot, ['是否确认出战', '确认出战', '将被锁定'], threshold=0.6)
         if any(k in words for k in ['是否确认出战', '确认出战', '将被锁定']):
-            log.info('出战确认节点检测到残留的锁定出战弹窗，点击确认')
-            self.round_by_find_and_click_area(
+            log.info('出战确认节点检测到残留的锁定出战弹窗，检测并点击确认')
+            area = self.ctx.screen_loader.get_area('危局强袭战-关卡详情', '锁定确认-确认')
+            return self.round_by_ocr_and_click(
                 self.last_screenshot,
-                '危局强袭战-关卡详情',
-                '锁定确认-确认',
+                target_cn='确认',
+                area=area,
                 crop_first=False,
                 success_wait=2.0,
+                retry_wait=1.5,
             )
-            time.sleep(1.0)
 
         res = self.round_by_find_area(self.last_screenshot, '通用-出战', '按钮-出战')
         if res.is_success:
@@ -558,7 +619,7 @@ class DeadlyAssaultApp(ZApplication):
         ocr_results = self.ctx.ocr.match_words(self.last_screenshot, ['出战'], threshold=0.6)
         if '出战' in ocr_results:
             log.info('OCR 识别到出战文字，点击出战')
-            self.round_by_ocr_and_click(self.last_screenshot, target_cn='出战', success_wait=2.0)
+            return self.round_by_ocr_and_click(self.last_screenshot, target_cn='出战', success_wait=2.0)
 
         return self.round_success()
 
@@ -569,13 +630,15 @@ class DeadlyAssaultApp(ZApplication):
         # 容错兜底：等待战斗期间若出现锁定弹窗阻挡，点击确认
         words = self.ctx.ocr.match_words(self.last_screenshot, ['是否确认出战', '确认出战', '将被锁定'], threshold=0.6)
         if any(k in words for k in ['是否确认出战', '确认出战', '将被锁定']):
-            log.info('等待战斗画面时检测到锁定出战弹窗，点击确认')
-            self.round_by_find_and_click_area(
+            log.info('等待战斗画面时检测到锁定出战弹窗，检测并点击确认')
+            area = self.ctx.screen_loader.get_area('危局强袭战-关卡详情', '锁定确认-确认')
+            self.round_by_ocr_and_click(
                 self.last_screenshot,
-                '危局强袭战-关卡详情',
-                '锁定确认-确认',
+                target_cn='确认',
+                area=area,
                 crop_first=False,
                 success_wait=2.0,
+                retry_wait=1.5,
             )
             return self.round_wait('已点击锁定出战确认，等待战斗画面加载', wait=1.5)
 
@@ -728,8 +791,7 @@ class DeadlyAssaultApp(ZApplication):
     @operation_node(name='战斗后等待主界面')
     def wait_after_battle(self) -> OperationRoundResult:
         """战斗结束后等待返回危局强袭战主界面 (Step 25)。"""
-        res = self.round_by_find_area(self.last_screenshot, '危局强袭战-主界面', '选定敌方')
-        if res.is_success:
+        if self.is_in_deadly_assault_main(self.last_screenshot):
             log.info('已成功返回危局强袭战主界面')
             return self.round_success()
 
@@ -740,21 +802,39 @@ class DeadlyAssaultApp(ZApplication):
     @node_from(from_name='选择首领关卡', status=STATUS_ALL_BOSSES_DONE)
     @operation_node(name='点击荣誉酬赏', node_max_retry_times=5)
     def click_reward_icon(self) -> OperationRoundResult:
-        """点击左下角荣誉酬赏图标（文字上方约10像素）(Step 26)。"""
+        """检测左下角荣誉酬赏并点击其上方图标 (Step 26)。"""
         if not self.config.claim_rewards:
             log.info('配置设置为不领取荣誉酬赏，跳过')
             return self.round_success(self.STATUS_SKIP_REWARD)
 
-        res = self.round_by_click_area(
-            '危局强袭战-主界面',
-            '荣誉酬赏-图标',
-            success_wait=2.0,
-            retry_wait=1.5,
-        )
-        if res.is_success:
+        # 检测左下角固定区域是否包含“荣誉酬赏”文字
+        area = self.ctx.screen_loader.get_area('危局强袭战-主界面', '荣誉酬赏')
+        crop = self.last_screenshot[area.rect.y1:area.rect.y2, area.rect.x1:area.rect.x2]
+        ocr_res = self.ctx.ocr.ocr(crop)
+        reward_items = [r for r in ocr_res if '荣誉' in r.data or '酬赏' in r.data]
+
+        if not reward_items:
+            # 扩大至左下角全量区域检测
+            all_ocr = self.ctx.ocr.ocr(self.last_screenshot[950:1080, 30:250])
+            reward_items = [r for r in all_ocr if '荣誉' in r.data or '酬赏' in r.data]
+            base_x, base_y = 30, 950
+        else:
+            base_x, base_y = area.rect.x1, area.rect.y1
+
+        if reward_items:
+            r = reward_items[0]
+            # 图标位于文字上方约 15 像素
+            icon_x = base_x + r.rect.center.x
+            icon_y = base_y + r.rect.y1 - 15
+            target_pt = Point(icon_x, icon_y)
+            log.info('检测到荣誉酬赏文字 (%s)，点击其上方图标位置 (%d, %d)',
+                     r.data, target_pt.x, target_pt.y)
+            self.ctx.controller.click(target_pt)
+            time.sleep(2.0)
             return self.round_success(self.STATUS_CLAIM_REWARD)
 
-        return self.round_retry('未能成功点击荣誉酬赏图标', wait=1.5)
+        log.warning('未在左下角检测到荣誉酬赏文字，等待重试')
+        return self.round_retry('未检测到荣誉酬赏文字', wait=1.5)
 
     @node_from(from_name='点击荣誉酬赏', status=STATUS_CLAIM_REWARD)
     @operation_node(name='点击全部领取', node_max_retry_times=5)
