@@ -59,3 +59,12 @@ class DeadlyAssaultConfig(ApplicationConfig):
     @auto_battle_config.setter
     def auto_battle_config(self, value: str) -> None:
         self.update('auto_battle_config', value)
+
+    @property
+    def cycle_anchor_dt(self) -> str:
+        """危局强袭战双周周五刷新基准日 (yyyyMMdd，默认 20261120 周五 04:00)"""
+        return self.get('cycle_anchor_dt', '20261120')
+
+    @cycle_anchor_dt.setter
+    def cycle_anchor_dt(self, value: str) -> None:
+        self.update('cycle_anchor_dt', value)

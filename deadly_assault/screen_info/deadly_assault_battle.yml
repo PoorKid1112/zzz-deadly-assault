@@ -20,7 +20,7 @@ area_list:
     text: 取消
     lcs_percent: 0.7
   - area_name: 锁定确认-确认
-    pc_rect: [1050, 620, 1200, 700]
+    pc_rect: [1000, 620, 1250, 710]
     text: 确认
     lcs_percent: 0.7
   - area_name: 返回

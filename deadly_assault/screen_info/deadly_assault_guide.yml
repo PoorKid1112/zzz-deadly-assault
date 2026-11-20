@@ -32,6 +32,6 @@ area_list:
     text: 阵容覆盖
     lcs_percent: 0.7
   - area_name: 阵容覆盖-确认
-    pc_rect: [1050, 790, 1180, 870]
+    pc_rect: [650, 780, 1300, 880]
     text: 确认
     lcs_percent: 0.7

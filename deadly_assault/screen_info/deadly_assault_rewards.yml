@@ -11,6 +11,11 @@ area_list:
     pc_rect: [920, 680, 1040, 770]
     text: 确认
     lcs_percent: 0.7
+  - area_name: 关闭
+    pc_rect: [1370, 210, 1480, 290]
+    template_sub_dir: menu
+    template_id: btn_close
+    template_match_threshold: 0.7
   - area_name: 返回
     pc_rect: [82, 13, 150, 90]
     template_sub_dir: menu
