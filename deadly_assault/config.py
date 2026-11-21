@@ -68,3 +68,12 @@ class DeadlyAssaultConfig(ApplicationConfig):
     @cycle_anchor_dt.setter
     def cycle_anchor_dt(self, value: str) -> None:
         self.update('cycle_anchor_dt', value)
+
+    @property
+    def two_day_mode(self) -> bool:
+        """分天运行模式：启用后第1天仅执行预处理（触发生成更多后直接返回），第2天再完整挑战（默认关闭）"""
+        return bool(self.get('two_day_mode', False))
+
+    @two_day_mode.setter
+    def two_day_mode(self, value: bool) -> None:
+        self.update('two_day_mode', bool(value))

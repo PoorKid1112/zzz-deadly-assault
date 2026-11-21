@@ -45,6 +45,9 @@ class DeadlyAssaultApp(ZApplication):
 
     STATUS_NEED_TEAM_GUIDE: ClassVar[str] = '需要配队'
     STATUS_SKIP_TEAM_GUIDE: ClassVar[str] = '跳过配队'
+    STATUS_SKIP_GENERATE: ClassVar[str] = '跳过生成'
+    STATUS_WAIT_GENERATE: ClassVar[str] = '等待生成'
+    STATUS_PREPARE_ONLY_DONE: ClassVar[str] = '分天预处理完成'
     STATUS_BATTLE_TARGET: ClassVar[str] = '挑战首领'
     STATUS_ALL_BOSSES_DONE: ClassVar[str] = '全部首领完成'
     STATUS_BATTLE_END: ClassVar[str] = '战斗结束'
@@ -79,6 +82,7 @@ class DeadlyAssaultApp(ZApplication):
         self.initial_apply_count: int = 0     # 点击生成更多前全部应用按钮数量
         self.initial_apply_ys: list[int] = [] # 点击生成更多前全部应用按钮的y坐标
         self.battle_start_time: float = 0.0   # 战斗开始时间戳
+        self.is_prepare_only_run: bool = False  # 分天运行模式：第1天仅做预处理，第2天才完整战斗
 
     def save_screenshot(self, prefix: str | None = None) -> str:
         """保存运行调试/错误截图至插件专属数据目录 plugin_data/deadly_assault，避免污染主仓库。"""
@@ -213,9 +217,17 @@ class DeadlyAssaultApp(ZApplication):
 
     @operation_node(name='开始', is_start_node=True)
     def start_node(self) -> OperationRoundResult:
-        """检查初始状态，如果在主界面直接进入下一步，否则返回大世界。"""
+        """检查初始状态，确定本次运行模式，如果在主界面直接进入下一步，否则返回大世界。"""
         self.boss_cycle = 0
         self.current_target_slot = -1
+
+        already_prepared = self.run_record is not None and self.run_record.has_prepare_done_in_period()
+        self.is_prepare_only_run = bool(self.config.two_day_mode and not already_prepared)
+        if self.config.two_day_mode:
+            if self.is_prepare_only_run:
+                log.info('分天运行模式已启用：当前为本周期第 1 天运行，仅触发配队生成后结束（不进战）')
+            else:
+                log.info('分天运行模式已启用：本周期已完成预处理，本次直接执行完整战斗与领奖流程')
 
         if self.is_in_deadly_assault_main(self.last_screenshot):
             log.info('当前已在危局强袭战主界面')
@@ -303,11 +315,12 @@ class DeadlyAssaultApp(ZApplication):
                         '主界面预检：3 个首领槽位均无 EMPTY 且已有成绩 (%s)，本周期挑战已完成，跳过配队与战斗',
                         scored_states2,
                     )
+                    self.is_prepare_only_run = False
                     if self.run_record is not None:
                         self.run_record.mark_all_slots_finished()
                     return self.round_success(self.STATUS_ALL_BOSSES_DONE)
 
-            if self.config.auto_team:
+            if self.is_prepare_only_run or self.config.auto_team:
                 return self.round_success(self.STATUS_NEED_TEAM_GUIDE)
             return self.round_success(self.STATUS_SKIP_TEAM_GUIDE)
 
@@ -400,20 +413,64 @@ class DeadlyAssaultApp(ZApplication):
     @node_from(from_name='点击智能推荐')
     @operation_node(name='点击生成更多', node_max_retry_times=5)
     def click_generate_more(self) -> OperationRoundResult:
-        """点击生成更多 (Step 9)。"""
+        """智能推荐生成分支 (Step 9)。
+
+        规则：
+        1. 先确认当前已处于「智能推荐」页（可见「生成更多」按钮），避免误识别「绳网精选」页中的全部应用按钮。
+        2. 若分天模式处于第 1 天预处理：严格按 prepare 规则点击「生成更多」后不等待，直接返回主界面并退回大世界。
+        3. 若处于普通全量模式或分天模式第 2 天：只要「全部应用-区域」检测到存在「全部应用」按钮，直接跳过 Step 9 进入 Step 10；
+           仅当不存在任何「全部应用」按钮时，才点击「生成更多」并进入等待生成阶段。
+        """
+        gen_area = self.ctx.screen_loader.get_area('危局强袭战-配队指引', '生成更多')
+        gen_crop = self.last_screenshot[gen_area.rect.y1:gen_area.rect.y2, gen_area.rect.x1:gen_area.rect.x2]
+        gen_ocr = [r for r in self.ctx.ocr.ocr(gen_crop) if '生成' in r.data]
+        if not gen_ocr:
+            log.warning('当前画面未检测到生成更多按钮，尝试重新点击智能推荐页签')
+            rec_area = self.ctx.screen_loader.get_area('危局强袭战-配队指引', '智能推荐')
+            self.round_by_ocr_and_click(
+                self.last_screenshot,
+                target_cn='智能推荐',
+                area=rec_area,
+                crop_first=False,
+                success_wait=1.5,
+            )
+            return self.round_retry('未进入智能推荐页面', wait=1.5)
+
+        if self.is_prepare_only_run:
+            res = self.round_by_ocr_and_click(
+                self.last_screenshot,
+                target_cn='生成更多',
+                area=gen_area,
+                crop_first=False,
+                success_wait=2.0,
+                retry_wait=1.5,
+            )
+            if not res.is_success:
+                return res
+            log.info('分天运行第 1 天（预处理）：已点击生成更多触发后台算队，不等待直接返回')
+            return self.round_success(self.STATUS_PREPARE_ONLY_DONE)
+
         apply_area = self.ctx.screen_loader.get_area('危局强袭战-配队指引', '全部应用-区域')
         crop = self.last_screenshot[apply_area.rect.y1:apply_area.rect.y2, apply_area.rect.x1:apply_area.rect.x2]
         ocr_res = self.ctx.ocr.ocr(crop)
         apply_buttons = [r for r in ocr_res if '全部' in r.data and '应用' in r.data]
-        self.initial_apply_count = len(apply_buttons)
-        self.initial_apply_ys = [apply_area.rect.y1 + r.rect.center.y for r in apply_buttons]
-        log.info('生成前全部应用按钮数量=%d, 纵坐标=%s', self.initial_apply_count, self.initial_apply_ys)
+        if apply_buttons:
+            apply_ys = [apply_area.rect.y1 + r.rect.center.y for r in apply_buttons]
+            log.info(
+                '检测到智能推荐页已存在 %d 个「全部应用」按钮 (y=%s)，跳过 Step 9 直接进入 Step 10',
+                len(apply_buttons),
+                apply_ys,
+            )
+            return self.round_success(self.STATUS_SKIP_GENERATE)
 
-        area = self.ctx.screen_loader.get_area('危局强袭战-配队指引', '生成更多')
+        self.initial_apply_count = 0
+        self.initial_apply_ys = []
+        log.info('当前智能推荐页暂无「全部应用」按钮，点击生成更多开始验算配队')
+
         res = self.round_by_ocr_and_click(
             self.last_screenshot,
             target_cn='生成更多',
-            area=area,
+            area=gen_area,
             crop_first=False,
             success_wait=1.8,
             retry_wait=1.5,
@@ -423,21 +480,12 @@ class DeadlyAssaultApp(ZApplication):
 
         self.generate_start_time = time.time()
         log.info('已触发生成更多，进入生成等待（最大 %d 秒）', self.config.wait_generate_seconds)
-        return self.round_success()
+        return self.round_success(self.STATUS_WAIT_GENERATE)
 
-    @node_from(from_name='点击生成更多')
+    @node_from(from_name='点击生成更多', status=STATUS_WAIT_GENERATE)
     @operation_node(name='等待生成配队')
     def wait_generation(self) -> OperationRoundResult:
-        """等待配队验算生成约5分钟 (Step 9)。
-
-        逻辑说明：
-        1. 至少缓冲等待 5 秒防抖，避免因网络短暂波动或刚点击的过渡帧造成误判。
-        2. 若配置等待时间为 0，直接跳过等待。
-        3. 若初始进入时界面上已有 >= 2 组推荐阵容（说明当前已有完整的新老生成阵容），在缓冲 5 秒后直接应用最新最下方阵容。
-        4. 若初始仅有 1 组或 0 组阵容：
-           持续轮询检测：当新卡片生成（“全部应用”按钮数增多，或下方 y > 750 出现新按钮）时，判定生成完毕，进入应用。
-        5. 若达到配置的最大等待时间（默认 300 秒/5分钟），超时保护触发，应用当前画面上的最优阵容。
-        """
+        """等待配队验算生成出现「全部应用」按钮或达到最大等待时间 (Step 9)。"""
         elapsed = time.time() - self.generate_start_time
 
         if self.config.wait_generate_seconds <= 0:
@@ -453,23 +501,9 @@ class DeadlyAssaultApp(ZApplication):
         current_buttons = [r for r in ocr_res if '全部' in r.data and '应用' in r.data]
         current_count = len(current_buttons)
 
-        if self.initial_apply_count >= 2:
-            log.info('界面上已包含多组推荐配队（共 %d 个全部应用），无需继续等待，直接应用', current_count)
-            return self.round_success()
-
-        has_new_card = False
-        if current_count > self.initial_apply_count:
-            has_new_card = True
-        else:
-            for r in current_buttons:
-                abs_y = apply_area.rect.y1 + r.rect.center.y
-                if abs_y > 750 and not any(abs(abs_y - y0) < 50 for y0 in self.initial_apply_ys):
-                    has_new_card = True
-                    break
-
-        if has_new_card:
-            log.info('检测到新生成的配队（已等待 %.1f 秒，按钮数: %d -> %d）',
-                     elapsed, self.initial_apply_count, current_count)
+        if current_count > 0:
+            log.info('检测到已生成「全部应用」按钮（共 %d 个，已等待 %.1f 秒），进入 Step 10',
+                     current_count, elapsed)
             return self.round_success()
 
         if elapsed >= self.config.wait_generate_seconds:
@@ -478,6 +512,7 @@ class DeadlyAssaultApp(ZApplication):
 
         return self.round_wait(f'等待配队生成中 (已等待 {int(elapsed)}/{self.config.wait_generate_seconds}s)', wait=3.0)
 
+    @node_from(from_name='点击生成更多', status=STATUS_SKIP_GENERATE)
     @node_from(from_name='等待生成配队')
     @operation_node(name='应用全部阵容', node_max_retry_times=5)
     def apply_all_teams(self) -> OperationRoundResult:
@@ -536,6 +571,7 @@ class DeadlyAssaultApp(ZApplication):
             return self.round_success()
 
     @node_from(from_name='确认阵容覆盖')
+    @node_from(from_name='点击生成更多', status=STATUS_PREPARE_ONLY_DONE)
     @operation_node(name='返回危局主界面', node_max_retry_times=5)
     def back_from_team_guide(self) -> OperationRoundResult:
         """点击左上角返回按钮回到危局强袭战主界面 (Step 12)。"""
@@ -549,7 +585,7 @@ class DeadlyAssaultApp(ZApplication):
                     pc_rect=Rect(650, 780, 1300, 880),
                     text='确认',
                 )
-            return self.round_by_ocr_and_click(
+            confirm_res = self.round_by_ocr_and_click(
                 self.last_screenshot,
                 target_cn='确认',
                 area=strip_area,
@@ -557,11 +593,16 @@ class DeadlyAssaultApp(ZApplication):
                 success_wait=2.0,
                 retry_wait=1.5,
             )
+            if confirm_res.is_success:
+                return self.round_wait('已确认阵容覆盖弹窗，继续返回主界面', wait=1.0)
+            return confirm_res
+
+        done_status = self.STATUS_PREPARE_ONLY_DONE if self.is_prepare_only_run else None
 
         # 检查是否已在危局主界面
         if self.is_in_deadly_assault_main(self.last_screenshot):
             log.info('已回到危局强袭战主界面')
-            return self.round_success()
+            return self.round_success(done_status)
 
         # 1. 尝试框架通用返回区域匹配
         res = self.round_by_find_and_click_area(
@@ -572,7 +613,7 @@ class DeadlyAssaultApp(ZApplication):
             retry_wait=1.5,
         )
         if res.is_success:
-            return self.round_success()
+            return self.round_success(done_status)
 
         # 2. 特征检测：配队指引左上角红色药丸状返回按键检测（位置 [60, 15, 160, 85]）
         if self.click_red_feature_in_rect(
@@ -582,7 +623,7 @@ class DeadlyAssaultApp(ZApplication):
             wait_sec=2.0,
             label='左上角红色返回按键',
         ):
-            return self.round_success()
+            return self.round_success(done_status)
 
         return self.round_retry('未检测到左上角返回按钮', wait=1.5)
 
@@ -1056,6 +1097,7 @@ class DeadlyAssaultApp(ZApplication):
 
     @node_from(from_name='点击确认奖励')
     @node_from(from_name='点击荣誉酬赏', status=STATUS_SKIP_REWARD)
+    @node_from(from_name='返回危局主界面', status=STATUS_PREPARE_ONLY_DONE)
     @node_notify(when=NotifyTiming.CURRENT_DONE, detail=True)
     @operation_node(name='返回大世界并结束')
     def back_to_world_finish(self) -> OperationRoundResult:
@@ -1070,7 +1112,14 @@ class DeadlyAssaultApp(ZApplication):
         op = BackToNormalWorld(self.ctx, ensure_normal_world=True)
         op.execute()
 
+        if self.is_prepare_only_run:
+            if self.run_record is not None:
+                self.run_record.mark_prepare_done()
+            log.info('危局强袭战-分天预处理完成：已触发配队生成，下次运行将跳过 Step 9 等待并执行挑战')
+            return self.round_success('危局强袭战-分天预处理完成')
+
         if self.run_record is not None:
+            self.run_record.mark_full_completed()
             log.info(
                 '危局强袭战全流程执行完成，本周期记录已保存（下次危局刷新日: %s 04:00）',
                 self.run_record.get_next_refresh_dt(),

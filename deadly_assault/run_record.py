@@ -1,11 +1,9 @@
 from __future__ import annotations
 
 import datetime
-import os
 import time
 from typing import TYPE_CHECKING, ClassVar
 
-from one_dragon.base.config import yaml_operator
 from one_dragon.base.operation.application_run_record import AppRunRecord
 from one_dragon.utils import os_utils
 from one_dragon.utils.log_utils import log
@@ -23,9 +21,11 @@ class DeadlyAssaultRunRecord(AppRunRecord):
     - 危局强袭战与式舆防卫战每周五凌晨 04:00（按账号区服偏移）交替刷新，各自周期为 14 天：
       这一周周五刷新危局 -> 下一周周五刷新式舆 -> 下下周周五刷新危局 -> 下下下周周五刷新式舆，以此类推。
     - 实机验证基准刷新日：2026-11-20（周五 04:00 危局强袭战刷新）。
-    - 一条龙运行时根据 `check_and_update_status()` 与 `is_done` 判断：
-      同一 14 天周期内已完成（`STATUS_SUCCESS` 或 3 个首领均已完成且已领奖）则直接跳过，
-      进入下一个危局刷新日（两周后的周五 04:00）后自动重置状态并执行。
+
+    分天运行模式（config.two_day_mode，默认关闭）：
+    - 启用后：同一 14 天周期内第 1 天仅按 prepare 规则触发配队生成后结束，并在「当天」标记为已完成以免重复运行；
+      进入第 2 天后（含跨第 1 个式舆周五）自动变为待运行，执行这一次全量挑战并标记全周期通关（若第 2 天未运行或中途失败则延后补完这一次）；
+      全周期通关后第 3 天起持续跳过（含跨第 1 个式舆周五），直到第 2 个周五（下次危局 04:00 刷新）自动彻底重置（若第 1 天预处理跨了第 2 个周五也一并重置，在新周期重新先执行预处理）。
     """
 
     DEFAULT_ANCHOR_DT: ClassVar[str] = '20261120'
@@ -137,6 +137,54 @@ class DeadlyAssaultRunRecord(AppRunRecord):
     def rewards_claimed(self, value: bool) -> None:
         self.update('rewards_claimed', bool(value))
 
+    @property
+    def prepare_only_pending(self) -> bool:
+        """分天模式下第 1 天预处理已完成但第 2 天尚未完整通关。"""
+        return bool(self.get('prepare_only_pending', False))
+
+    @property
+    def prepare_period_start_dt(self) -> str:
+        """记录最近一次分天预处理所属的危局 14 天周期起始日。"""
+        val = self.get('prepare_period_start_dt', '')
+        return val if self._is_valid_dt(val) else ''
+
+    @property
+    def prepare_dt(self) -> str:
+        """记录最近一次分天预处理执行的游戏日。"""
+        val = self.get('prepare_dt', '')
+        return val if self._is_valid_dt(val) else ''
+
+    @property
+    def full_completed(self) -> bool:
+        """当前周期完整流程（战斗+领奖或主界面已全通关）是否已完成。"""
+        return bool(self.get('full_completed', False))
+
+    def has_prepare_done_in_period(self, dt: str | None = None) -> bool:
+        """判断当前 14 天周期内是否已完成过第 1 天预处理。"""
+        if self._should_reset_by_dt():
+            return False
+        target_period = self.get_period_start_dt(dt)
+        return self.prepare_period_start_dt == target_period
+
+    def mark_prepare_done(self) -> None:
+        """分天模式第 1 天预处理完成：标记当天已做预处理，保留第 2 天待战斗。"""
+        current_dt = self.get_current_dt()
+        current_period = self.get_period_start_dt(current_dt)
+        self.update('prepare_only_pending', True, False)
+        self.update('full_completed', False, False)
+        self.update('prepare_dt', current_dt, False)
+        self.update('prepare_period_start_dt', current_period, False)
+        self.update('period_start_dt', current_period, False)
+        self.save()
+
+    def mark_full_completed(self) -> None:
+        """标记当前 14 天周期已完整通关并清除分天待战状态。"""
+        current_period = self.get_period_start_dt(self.get_current_dt())
+        self.update('full_completed', True, False)
+        self.update('prepare_only_pending', False, False)
+        self.update('period_start_dt', current_period, False)
+        self.save()
+
     def _should_reset_by_dt(self) -> bool:
         """判断是否已跨入新的危局 14 天刷新周期。"""
         current_dt = self.get_current_dt()
@@ -145,66 +193,39 @@ class DeadlyAssaultRunRecord(AppRunRecord):
             return True
         return recorded_period != self.get_period_start_dt(current_dt)
 
-    def _is_sibling_finished_for_period(self, sibling_app_id: str, target_period: str) -> bool:
-        """检查同账号下危局系列其他模式在当前 14 天周期内是否已通关。"""
-        if self.file_path is None:
-            return False
-        sibling_path = os.path.join(os.path.dirname(self.file_path), f'{sibling_app_id}.yml')
-        if not os.path.exists(sibling_path):
-            return False
-        try:
-            data = yaml_operator.read_cache_or_load(sibling_path)
-        except Exception:
-            return False
-        if not isinstance(data, dict):
+    @property
+    def is_finished_by_period(self) -> bool:
+        """判断当前 14 天危局周期是否已完成（或分天模式第 1 天当天已预处理完毕）。"""
+        current_dt = self.get_current_dt()
+        if self._should_reset_by_dt():
             return False
 
-        sib_period = data.get('period_start_dt', '')
-        if not self._is_valid_dt(sib_period):
-            sib_dt = data.get('dt', '')
-            if not self._is_valid_dt(sib_dt):
-                return False
-            sib_period = self.get_period_start_dt(sib_dt)
+        if self.full_completed:
+            return True
+        if self.next_pending_slot_idx() is None:
+            if self.config is None or not self.config.claim_rewards or self.rewards_claimed:
+                return True
 
-        if sib_period != target_period:
+        # 分天模式第 1 天完成预处理：仅当天视为已完成，进入次日（包含跨第一个式舆周五）即开放第 2 天挑战
+        if self.prepare_only_pending:
+            if self.config is None or self.config.two_day_mode:
+                return self.dt == current_dt and self.run_status == AppRunRecord.STATUS_SUCCESS
             return False
 
-        if data.get('run_status') == AppRunRecord.STATUS_SUCCESS:
+        # 兼容未携带 full_completed / prepare_only_pending 的旧版成功记录
+        if self.run_status == AppRunRecord.STATUS_SUCCESS:
             return True
 
-        raw_slots = data.get('finished_slots', [])
-        if isinstance(raw_slots, list):
-            valid_slots = {
-                int(x) for x in raw_slots
-                if isinstance(x, int) and not isinstance(x, bool) and 0 <= x < self.TOTAL_SLOTS
-            }
-            if len(valid_slots) >= self.TOTAL_SLOTS:
-                need_claim = self.config.claim_rewards if self.config is not None else True
-                if not need_claim or bool(data.get('rewards_claimed', False)):
-                    return True
         return False
 
     @property
-    def is_finished_by_period(self) -> bool:
-        """判断当前 14 天危局周期是否已全部完成（含本应用与战斗模式共享结果）。"""
-        current_period = self.get_period_start_dt(self.get_current_dt())
-        if not self._should_reset_by_dt():
-            if self.run_status == AppRunRecord.STATUS_SUCCESS:
-                return True
-            if self.next_pending_slot_idx() is None:
-                if self.config is None or not self.config.claim_rewards or self.rewards_claimed:
-                    return True
-
-        return self._is_sibling_finished_for_period('deadly_assault_battle', current_period)
-
-    @property
     def is_done(self) -> bool:
-        """一条龙运行判断：当前危局周期已完成时返回 True 并跳过本次运行。"""
+        """一条龙运行判断：当前无需继续执行时返回 True 并跳过本次运行。"""
         return self.is_finished_by_period
 
     @property
     def run_status_under_now(self) -> int:
-        """基于当前时间与双周交替刷新规则显示的运行状态。"""
+        """基于当前时间、双周交替刷新与分天状态显示的运行状态。"""
         if self.is_finished_by_period:
             return AppRunRecord.STATUS_SUCCESS
         if self._should_reset_by_dt():
@@ -228,10 +249,14 @@ class DeadlyAssaultRunRecord(AppRunRecord):
         self.save()
 
     def reset_record(self) -> None:
-        """重置危局运行记录为待运行，并清空本周期槽位与领奖进度。"""
+        """重置危局运行记录为待运行，并清空本周期槽位、领奖与分天预处理进度。"""
         AppRunRecord.reset_record(self)
         self.update('finished_slots', [], False)
         self.update('rewards_claimed', False, False)
+        self.update('prepare_only_pending', False, False)
+        self.update('full_completed', False, False)
+        self.update('prepare_dt', '', False)
+        self.update('prepare_period_start_dt', '', False)
         self.update('period_start_dt', self.get_period_start_dt(self.get_current_dt()), False)
         self.save()
 
@@ -247,5 +272,5 @@ class DeadlyAssaultRunRecord(AppRunRecord):
             )
             self.reset_record()
         elif not self.is_finished_by_period and self.dt != current_dt:
-            # 同一 14 天周期内上一天失败或中断，次日仅重置运行状态以便重试，保留已完成的首领槽位进度
+            # 同一 14 天周期内：第 1 天预处理完成等待第 2 天战斗，或上次战斗中断待续，仅重置日状态并保留周期进度
             AppRunRecord.reset_record(self)

@@ -1,9 +1,9 @@
 {
   "id": "deadly_assault",
   "name": "危局强袭战",
-  "summary": "自动进入危局强袭战（试炼模式），应用智能推荐配队，依次挑战三个首领并自动战斗，完成后领取荣誉酬赏。支持双周周五交替周期判断与拆分版状态共享。",
-  "version": "1.1.0",
-  "versionCode": 3,
+  "summary": "自动进入危局强袭战（试炼模式），检测到「全部应用」自动跳过生成等待，挑战三首领并领奖；支持双周交替周期判断与分天运行模式。",
+  "version": "1.2.0",
+  "versionCode": 4,
   "author": {
     "name": "PoorKid1112",
     "url": "https://github.com/PoorKid1112"
