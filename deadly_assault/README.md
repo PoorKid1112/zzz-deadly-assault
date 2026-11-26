@@ -61,3 +61,9 @@ deadly_assault/
 └── assets/
     └── cover.webp            # WebP 封面
 ```
+
+---
+
+## 相关讨论
+
+- 主仓库功能建议：[OneDragon-Anything/ZenlessZoneZero-OneDragon#3020](https://github.com/OneDragon-Anything/ZenlessZoneZero-OneDragon/issues/3020)
