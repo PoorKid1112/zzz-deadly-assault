@@ -934,32 +934,45 @@ class DeadlyAssaultApp(ZApplication):
         self.ctx.auto_battle_context.start_auto_battle()
 
         self.battle_start_time = time.time()
+        self._last_end_ocr_time = 0.0
+        self._out_of_battle_since = None
         return self.round_success()
 
     @node_from(from_name='向前走并启动战斗')
     @operation_node(name='自动战斗中', mute=True)
     def auto_battle_loop(self) -> OperationRoundResult:
         """自动战斗循环，直至结算退出按钮出现 (Step 15 -> Step 16)。"""
-        exit_area = self.ctx.screen_loader.get_area('战斗画面', '战斗结果-退出')
-        if exit_area is not None:
-            res = self.round_by_find_area(self.last_screenshot, '战斗画面', '战斗结果-退出')
-            if res.is_success:
-                log.info('检测到结算退出按钮，停止自动战斗')
-                self.ctx.auto_battle_context.stop_auto_battle()
-                return self.round_success(self.STATUS_BATTLE_END)
-
-        ocr_results = self.ctx.ocr.match_words(self.last_screenshot, ['退出', '挑战结果', '再来一次'], threshold=0.6)
-        if '退出' in ocr_results or '挑战结果' in ocr_results or '再来一次' in ocr_results:
-            log.info('OCR 识别到结算画面 (%s)，停止自动战斗', list(ocr_results.keys()))
-            self.ctx.auto_battle_context.stop_auto_battle()
-            return self.round_success(self.STATUS_BATTLE_END)
-
-        if time.time() - self.battle_start_time > 600:
+        now = time.time()
+        if now - self.battle_start_time > 600:
             log.warning('战斗超时 (600s)，强制停止战斗')
             self.ctx.auto_battle_context.stop_auto_battle()
             return self.round_fail('战斗超时')
 
-        self.ctx.auto_battle_context.check_battle_state(self.last_screenshot, self.last_screenshot_time)
+        in_battle = self.ctx.auto_battle_context.check_battle_state(self.last_screenshot, self.last_screenshot_time)
+
+        if in_battle:
+            self._out_of_battle_since = None
+        else:
+            if self._out_of_battle_since is None:
+                self._out_of_battle_since = now
+
+            exit_area = self.ctx.screen_loader.get_area('战斗画面', '战斗结果-退出')
+            if exit_area is not None:
+                res = self.round_by_find_area(self.last_screenshot, '战斗画面', '战斗结果-退出')
+                if res.is_success:
+                    log.info('检测到结算退出按钮，停止自动战斗')
+                    self.ctx.auto_battle_context.stop_auto_battle()
+                    return self.round_success(self.STATUS_BATTLE_END)
+
+            # 仅在连续离开战斗画面 >= 4s 后才触发全屏 OCR 兜底，避免大招/连携技期间误触发造成卡顿
+            if (now - self._out_of_battle_since >= 4.0) and (now - getattr(self, '_last_end_ocr_time', 0.0) >= 3.0):
+                self._last_end_ocr_time = now
+                ocr_results = self.ctx.ocr.match_words(self.last_screenshot, ['退出', '挑战结果', '再来一次'], threshold=0.6)
+                if '退出' in ocr_results or '挑战结果' in ocr_results or '再来一次' in ocr_results:
+                    log.info('OCR 识别到结算画面 (%s)，停止自动战斗', list(ocr_results.keys()))
+                    self.ctx.auto_battle_context.stop_auto_battle()
+                    return self.round_success(self.STATUS_BATTLE_END)
+
         interval = self.ctx.battle_assistant_config.screenshot_interval or 0.05
         return self.round_wait(wait=interval)
 
